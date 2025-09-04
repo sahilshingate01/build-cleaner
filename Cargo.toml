@@ -1,0 +1,20 @@
+[package]
+name = "buildcleaner"
+version = "0.1.0"
+edition = "2021"
+description = "Find and reclaim space from build caches, dependency dirs, and generated output."
+license = "MIT"
+authors = ["Sahil Shingate"]
+readme = "README.md"
+keywords = ["cli", "disk", "cache", "cleanup", "node_modules"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+rayon = "1"
+terminal_size = "0.4.4"
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
