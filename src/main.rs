@@ -84,11 +84,126 @@ enum ProgressWhen {
     Never,
 }
 
+/// How results leave the engine. `text` is for humans; `json` and `stream-json`
+/// are the machine contract a UI drives.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum OutputFormat {
+    Text,
+    Json,
+    StreamJson,
+}
+
+/// How the engine receives *what to work on* when not scanning a path.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum InputFormat {
+    Text,
+    StreamJson,
+}
+
+/// `--output-format` wins; the legacy `--json` / `--stream` flags are kept as aliases.
+fn effective_output(cli: &Cli) -> OutputFormat {
+    if let Some(f) = cli.output_format {
+        f
+    } else if cli.stream {
+        OutputFormat::StreamJson
+    } else if cli.json {
+        OutputFormat::Json
+    } else {
+        OutputFormat::Text
+    }
+}
+
+#[derive(Clone)]
+struct Target {
+    name: String,
+    category: String,
+    /// If non-empty, the dir only matches when the PARENT contains one of these
+    /// marker files. Entries beginning with `*.` match by extension.
+    markers: Vec<String>,
+}
+
+impl Target {
+    fn new(name: &str, category: &str, markers: &[&str]) -> Self {
+        Target {
+            name: name.to_string(),
+            category: category.to_string(),
+            markers: markers.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+}
+
+/// The curated list: directories that are safe to delete because a build system
+/// or package manager can regenerate them. Generic names are gated behind a
+/// marker file so we never touch a hand-authored `dist/`, `build/`, `target/`...
+fn default_targets() -> Vec<Target> {
+    let t = |n: &str, c: &str, m: &[&str]| Target::new(n, c, m);
+    vec![
+        // --- JS / TS ecosystems ---
+        t("node_modules", "node", &[]),
+        t(".next", "next", &[]),
+        t(".nuxt", "nuxt", &[]),
+        t(".output", "nitro", &[]),
+        t(".turbo", "turbo", &[]),
+        t(".svelte-kit", "svelte", &[]),
+        t(".angular", "angular", &[]),
+        t(".astro", "astro", &[]),
+        t(".parcel-cache", "parcel", &[]),
+        t(".vite", "vite", &[]),
+        t(".expo", "expo", &[]),
+        t(".serverless", "serverless", &[]),
+        t("bower_components", "bower", &[]),
+        t("jspm_packages", "jspm", &[]),
+        t("dist", "dist", &["package.json"]),
+        t("build", "build", &["package.json"]),
+        t("coverage", "coverage", &["package.json"]),
+        t(".nyc_output", "coverage", &[]),
+        // --- generic caches (rebuildable) ---
+        t(".cache", "cache", &[]),
+        // --- Rust / Zig / native ---
+        t("target", "target", &["Cargo.toml", "pom.xml"]),
+        t("zig-cache", "zig", &[]),
+        t(".zig-cache", "zig", &[]),
+        t("zig-out", "zig", &[]),
+        t("CMakeFiles", "cmake", &[]),
+        t("cmake-build-debug", "cmake", &[]),
+        t("cmake-build-release", "cmake", &[]),
+        t("obj", "dotnet", &["*.csproj", "*.fsproj", "*.vbproj"]),
+        // --- JVM ---
+        t(".gradle", "gradle", &[]),
+        // --- Python ---
+        t("__pycache__", "python", &[]),
+        t(".pytest_cache", "python", &[]),
+        t(".mypy_cache", "python", &[]),
+        t(".ruff_cache", "python", &[]),
+        t(".tox", "python", &[]),
+        // --- Dart / Flutter ---
+        t(".dart_tool", "dart", &[]),
+        // --- PHP / Go ---
+        t("vendor", "vendor", &["composer.json", "go.mod"]),
+        // --- Apple ---
+        t("Pods", "cocoapods", &["Podfile"]),
+        t("DerivedData", "xcode", &[]),
+        // --- Elixir / Haskell / Elm ---
+        t("_build", "elixir", &["mix.exs"]),
+        t("deps", "elixir", &["mix.exs"]),
+        t("dist-newstyle", "haskell", &[]),
+        t(".stack-work", "haskell", &[]),
+        t("elm-stuff", "elm", &[]),
+        // --- Infra ---
+        t(".terraform", "terraform", &[]),
+    ]
+}
+
+fn parse_config(path: &Path) -> io::Result<Vec<Target>> {
 
 fn main() {
     let cli = Cli::parse();
-    println!("buildcleaner v{}", env!("CARGO_PKG_VERSION"));
-    if cli.paths.is_empty() {
-        println!("No scan paths specified. Defaulting to current directory.");
+    let targets = default_targets();
+    if cli.list_targets {
+        for t in &targets {
+            println!("{}:{}", t.name, t.category);
+        }
+        return;
     }
+    println!("buildcleaner: loaded {} default targets", targets.len());
 }
