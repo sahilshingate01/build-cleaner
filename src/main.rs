@@ -195,15 +195,76 @@ fn default_targets() -> Vec<Target> {
 }
 
 fn parse_config(path: &Path) -> io::Result<Vec<Target>> {
+fn build_index(targets: &[Target]) -> HashMap<String, usize> {
+    let mut m = HashMap::new();
+    for (i, t) in targets.iter().enumerate() {
+        m.insert(t.name.clone(), i); // later entries (config/include) win
+    }
+    m
+}
+
+fn parent_has_marker(parent: &Path, marker: &str) -> bool {
+    if let Some(ext) = marker.strip_prefix("*.") {
+        let suffix = format!(".{}", ext);
+        if let Ok(rd) = fs::read_dir(parent) {
+            for e in rd.flatten() {
+                if let Some(n) = e.file_name().to_str() {
+                    if n.ends_with(&suffix) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    } else {
+        parent.join(marker).exists()
+    }
+}
+
+fn match_target<'a>(
+    name: &str,
+    dir: &Path,
+    index: &HashMap<String, usize>,
+    targets: &'a [Target],
+) -> Option<&'a Target> {
+    let t = &targets[*index.get(name)?];
+    if t.markers.is_empty() {
+        return Some(t);
+    }
+    let parent = dir.parent()?;
+    if t.markers.iter().any(|m| parent_has_marker(parent, m)) {
+        Some(t)
+    } else {
+        None
+    }
+}
+
+struct Ctx<'a> {
+    targets: &'a [Target],
+    index: &'a HashMap<String, usize>,
+    excludes: &'a HashSet<String>,
+    follow_symlinks: bool,
+}
+
+#[derive(Clone)]
+struct Sized {
+    path: PathBuf,
+    category: String,
+    bytes: u64,
+    files: u64,
+}
+
+struct Progress {
+    scanned: AtomicU64,
+    matches: Mutex<Vec<Sized>>,
+    visited: Mutex<HashSet<PathBuf>>,
+}
+
+fn scan(dir: &Path, ctx: &Ctx, prog: &Progress, root: &Path) {
 
 fn main() {
     let cli = Cli::parse();
     let targets = default_targets();
-    if cli.list_targets {
-        for t in &targets {
-            println!("{}:{}", t.name, t.category);
-        }
-        return;
-    }
-    println!("buildcleaner: loaded {} default targets", targets.len());
+    let index = build_index(&targets);
+    println!("buildcleaner: compiled {} indexed target rules", index.len());
 }
