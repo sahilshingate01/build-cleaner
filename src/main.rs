@@ -261,10 +261,72 @@ struct Progress {
 }
 
 fn scan(dir: &Path, ctx: &Ctx, prog: &Progress, root: &Path) {
+    prog.scanned.fetch_add(1, Ordering::Relaxed);
+    let rd = match fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(_) => return, // permission denied etc. — skip quietly
+    };
+    let mut subdirs: Vec<PathBuf> = Vec::new();
+    for entry in rd.flatten() {
+        let ft = match entry.file_type() {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let name_os = entry.file_name();
+        let name = name_os.to_string_lossy();
+        if ctx.excludes.contains(name.as_ref()) {
+            continue;
+        }
+        let path = entry.path();
+        if ft.is_symlink() {
+            if !ctx.follow_symlinks {
+                continue;
+            }
+            let resolved = match fs::canonicalize(&path) {
+                Ok(path) if path.starts_with(root) => path,
+                _ => continue,
+            };
+            if !resolved.is_dir() || !prog.visited.lock().unwrap().insert(resolved.clone()) {
+                continue;
+            }
+            // A link is never itself a deletion candidate. Traverse its resolved,
+            // in-root directory instead, so only real target directories match.
+            subdirs.push(resolved);
+            continue;
+        }
+        if !ft.is_dir() || !prog.visited.lock().unwrap().insert(path.clone()) {
+            continue;
+        }
+        if let Some(t) = match_target(name.as_ref(), &path, ctx.index, ctx.targets) {
+            let (bytes, files) = dir_size(&path, ctx.follow_symlinks);
+            prog.matches.lock().unwrap().push(Sized {
+                path,
+                category: t.category.clone(),
+                bytes,
+                files,
+            });
+        } else {
+            subdirs.push(path);
+        }
+    }
+    subdirs.par_iter().for_each(|d| scan(d, ctx, prog, root));
+}
+
+fn dir_size(dir: &Path, follow_symlinks: bool) -> (u64, u64) {
 
 fn main() {
     let cli = Cli::parse();
     let targets = default_targets();
     let index = build_index(&targets);
-    println!("buildcleaner: compiled {} indexed target rules", index.len());
+    let ctx = Ctx {
+        targets,
+        index,
+        min_size: 0,
+        follow_symlinks: cli.follow_symlinks,
+        exclude: HashSet::new(),
+    };
+    let prog = Progress::default();
+    let root = cli.paths.first().cloned().unwrap_or_else(|| PathBuf::from("."));
+    scan(&root, &ctx, &prog, &root);
+    println!("Scanned {} directories, found {} matches", prog.scanned.load(Ordering::Relaxed), prog.matches.lock().unwrap().len());
 }
