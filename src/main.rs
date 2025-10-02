@@ -313,6 +313,59 @@ fn scan(dir: &Path, ctx: &Ctx, prog: &Progress, root: &Path) {
 }
 
 fn dir_size(dir: &Path, follow_symlinks: bool) -> (u64, u64) {
+    let mut visited = HashSet::new();
+    dir_size_inner(dir, follow_symlinks, &mut visited)
+}
+
+fn dir_size_inner(dir: &Path, follow_symlinks: bool, visited: &mut HashSet<PathBuf>) -> (u64, u64) {
+    let canonical = match fs::canonicalize(dir) {
+        Ok(path) => path,
+        Err(_) => return (0, 0),
+    };
+    if !visited.insert(canonical) {
+        return (0, 0);
+    }
+    let mut bytes = 0u64;
+    let mut files = 0u64;
+    let rd = match fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(_) => return (0, 0),
+    };
+    for entry in rd.flatten() {
+        let ft = match entry.file_type() {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        if ft.is_symlink() {
+            if follow_symlinks {
+                if let Ok(m) = fs::metadata(entry.path()) {
+                    if m.is_file() {
+                        bytes += m.len();
+                        files += 1;
+                    } else if m.is_dir() {
+                        let (b, f) = dir_size_inner(&entry.path(), follow_symlinks, visited);
+                        bytes += b;
+                        files += f;
+                    }
+                }
+            }
+            continue;
+        }
+        if ft.is_dir() {
+            let (b, f) = dir_size_inner(&entry.path(), follow_symlinks, visited);
+            bytes += b;
+            files += f;
+        } else if let Ok(m) = entry.metadata() {
+            bytes += m.len();
+            files += 1;
+        }
+    }
+    (bytes, files)
+}
+
+/// Pull any matches discovered since `consumed` out of the shared vec, releasing
+/// the lock before the caller does I/O with them.
+fn take_new(prog: &Progress, consumed: &mut usize) -> Vec<Sized> {
 
 fn main() {
     let cli = Cli::parse();
@@ -328,5 +381,6 @@ fn main() {
     let prog = Progress::default();
     let root = cli.paths.first().cloned().unwrap_or_else(|| PathBuf::from("."));
     scan(&root, &ctx, &prog, &root);
-    println!("Scanned {} directories, found {} matches", prog.scanned.load(Ordering::Relaxed), prog.matches.lock().unwrap().len());
+    let matches = prog.matches.lock().unwrap();
+    println!("Scanned {} dirs: {} matches, {} bytes total", prog.scanned.load(Ordering::Relaxed), matches.len(), prog.total_bytes.load(Ordering::Relaxed));
 }
