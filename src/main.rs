@@ -366,6 +366,94 @@ fn dir_size_inner(dir: &Path, follow_symlinks: bool, visited: &mut HashSet<PathB
 /// Pull any matches discovered since `consumed` out of the shared vec, releasing
 /// the lock before the caller does I/O with them.
 fn take_new(prog: &Progress, consumed: &mut usize) -> Vec<Sized> {
+fn human(bytes: u64) -> String {
+    const U: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
+    if bytes < 1024 {
+        return format!("{} B", bytes);
+    }
+    let mut b = bytes as f64;
+    let mut i = 0;
+    while b >= 1024.0 && i < U.len() - 1 {
+        b /= 1024.0;
+        i += 1;
+    }
+    format!("{:.1} {}", b, U[i])
+}
+
+/// Shorten an over-long path by keeping the head and tail with a `…` in the
+/// middle (leaf name matters most, root gives context, deep middle is least
+/// useful). `max == 0` disables truncation (piped / non-tty / JSON).
+fn elide(s: &str, max: usize) -> String {
+    if max == 0 {
+        return s.to_string();
+    }
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    if max <= 1 {
+        return "…".to_string();
+    }
+    let keep = max - 1;
+    let head = keep / 2;
+    let tail = keep - head; // bias toward the end
+    let head_str: String = s.chars().take(head).collect();
+    let tail_str: String = s.chars().skip(n - tail).collect();
+    format!("{}…{}", head_str, tail_str)
+}
+
+fn commafy(n: u64) -> String {
+    let s = n.to_string();
+    let b = s.as_bytes();
+    let len = b.len();
+    let mut out = String::with_capacity(len + len / 3);
+    for (i, c) in b.iter().enumerate() {
+        if i > 0 && (len - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*c as char);
+    }
+    out
+}
+
+fn parse_size(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let idx = s
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(s.len());
+    let (num, unit) = s.split_at(idx);
+    let num: f64 = num.parse().ok()?;
+    let mult = match unit.trim().to_ascii_uppercase().as_str() {
+        "" | "B" => 1.0,
+        "K" | "KB" | "KIB" => 1024.0,
+        "M" | "MB" | "MIB" => 1024.0 * 1024.0,
+        "G" | "GB" | "GIB" => 1024.0 * 1024.0 * 1024.0,
+        "T" | "TB" | "TIB" => 1024.0_f64.powi(4),
+        _ => return None,
+    };
+    Some((num * mult) as u64)
+}
+
+fn json_escape(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o
+}
+
+fn categories_sorted(sized: &[Sized]) -> Vec<(String, u64, usize)> {
 
 fn main() {
     let cli = Cli::parse();
@@ -382,5 +470,5 @@ fn main() {
     let root = cli.paths.first().cloned().unwrap_or_else(|| PathBuf::from("."));
     scan(&root, &ctx, &prog, &root);
     let matches = prog.matches.lock().unwrap();
-    println!("Scanned {} dirs: {} matches, {} bytes total", prog.scanned.load(Ordering::Relaxed), matches.len(), prog.total_bytes.load(Ordering::Relaxed));
+    println!("Scanned {} dirs: {} matches (reclaimable: {})", commafy(prog.scanned.load(Ordering::Relaxed)), matches.len(), human(prog.total_bytes.load(Ordering::Relaxed)));
 }
