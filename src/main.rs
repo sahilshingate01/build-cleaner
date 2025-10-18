@@ -470,5 +470,7 @@ fn main() {
     let root = cli.paths.first().cloned().unwrap_or_else(|| PathBuf::from("."));
     scan(&root, &ctx, &prog, &root);
     let matches = prog.matches.lock().unwrap();
-    println!("Scanned {} dirs: {} matches (reclaimable: {})", commafy(prog.scanned.load(Ordering::Relaxed)), matches.len(), human(prog.total_bytes.load(Ordering::Relaxed)));
+    for m in matches.iter() {
+        println!("{:>10}  {:<12}  {}", human(m.bytes), m.category, elide(&m.path.display().to_string(), 70));
+    }
 }
