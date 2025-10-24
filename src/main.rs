@@ -366,6 +366,91 @@ fn dir_size_inner(dir: &Path, follow_symlinks: bool, visited: &mut HashSet<PathB
 /// Pull any matches discovered since `consumed` out of the shared vec, releasing
 /// the lock before the caller does I/O with them.
 fn take_new(prog: &Progress, consumed: &mut usize) -> Vec<Sized> {
+    let v = prog.matches.lock().unwrap();
+    if v.len() > *consumed {
+        let slice = v[*consumed..].to_vec();
+        *consumed = v.len();
+        slice
+    } else {
+        Vec::new()
+    }
+}
+
+/// Human live view: stream each match to stdout as it arrives and keep a spinner
+/// status line on stderr. Single-threaded, so parallel scan workers never garble.
+fn human_reporter(
+    prog: &Progress,
+    done: &AtomicBool,
+    start: Instant,
+    min_size: u64,
+    path_width: usize,
+) {
+    const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let mut frame = 0usize;
+    let mut consumed = 0usize;
+    let mut shown = 0u64;
+    let mut running = 0u64;
+    let mut header = false;
+
+    loop {
+        let newly = take_new(prog, &mut consumed);
+        if newly.iter().any(|s| s.bytes >= min_size) {
+            {
+                let mut e = io::stderr().lock();
+                let _ = write!(e, "\r\x1b[2K");
+                let _ = e.flush();
+            }
+            let mut out = io::stdout().lock();
+            for s in &newly {
+                if s.bytes < min_size {
+                    continue;
+                }
+                if !header {
+                    let _ = writeln!(out, "{:>10}  {:<11}  PATH", "SIZE", "CATEGORY");
+                    header = true;
+                }
+                let _ = writeln!(
+                    out,
+                    "{:>10}  {:<11}  {}",
+                    human(s.bytes),
+                    s.category,
+                    elide(&s.path.to_string_lossy(), path_width)
+                );
+                shown += 1;
+                running += s.bytes;
+            }
+            let _ = out.flush();
+        }
+
+        if done.load(Ordering::Relaxed) {
+            let mut e = io::stderr().lock();
+            let _ = write!(e, "\r\x1b[2K");
+            let _ = e.flush();
+            break;
+        }
+
+        let scanned = prog.scanned.load(Ordering::Relaxed);
+        {
+            let mut e = io::stderr().lock();
+            let _ = write!(
+                e,
+                "\r\x1b[2K{}  {} dirs · {} matches · {} reclaimable · {}s",
+                SPIN[frame % SPIN.len()],
+                commafy(scanned),
+                shown,
+                human(running),
+                start.elapsed().as_secs()
+            );
+            let _ = e.flush();
+        }
+        frame += 1;
+        thread::sleep(Duration::from_millis(80));
+    }
+}
+
+/// Machine live view: emit newline-delimited JSON events on stdout — a `match`
+/// per reclaimable dir as it's sized, and a `progress` heartbeat each tick.
+fn ndjson_reporter(prog: &Progress, done: &AtomicBool, start: Instant, min_size: u64) {
 fn human(bytes: u64) -> String {
     const U: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
     if bytes < 1024 {
@@ -467,10 +552,12 @@ fn main() {
         exclude: HashSet::new(),
     };
     let prog = Progress::default();
+    let done = AtomicBool::new(false);
+    let start = Instant::now();
     let root = cli.paths.first().cloned().unwrap_or_else(|| PathBuf::from("."));
-    scan(&root, &ctx, &prog, &root);
-    let matches = prog.matches.lock().unwrap();
-    for m in matches.iter() {
-        println!("{:>10}  {:<12}  {}", human(m.bytes), m.category, elide(&m.path.display().to_string(), 70));
-    }
+    thread::scope(|s| {
+        s.spawn(|| human_reporter(&prog, &done, start, 0));
+        scan(&root, &ctx, &prog, &root);
+        done.store(true, Ordering::SeqCst);
+    });
 }
