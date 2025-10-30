@@ -539,6 +539,133 @@ fn json_escape(s: &str) -> String {
 }
 
 fn categories_sorted(sized: &[Sized]) -> Vec<(String, u64, usize)> {
+    let mut agg: HashMap<&str, (u64, usize)> = HashMap::new();
+    for s in sized {
+        let e = agg.entry(s.category.as_str()).or_default();
+        e.0 += s.bytes;
+        e.1 += 1;
+    }
+    let mut cats: Vec<(String, u64, usize)> = agg
+        .into_iter()
+        .map(|(c, (b, n))| (c.to_string(), b, n))
+        .collect();
+    cats.sort_by_key(|c| Reverse(c.1));
+    cats
+}
+
+fn print_targets(targets: &[Target]) {
+    println!("# buildcleaner targets (reverse .gitignore)");
+    println!("# format: name[:category[:marker,...]]  — markers gate generic names (checked in the parent dir)");
+    for t in targets {
+        if t.markers.is_empty() {
+            println!("{}:{}", t.name, t.category);
+        } else {
+            println!("{}:{}:{}", t.name, t.category, t.markers.join(","));
+        }
+    }
+}
+
+fn print_json(sized: &[Sized], scanned: u64, secs: f64) {
+fn print_breakdown(sized: &[Sized], delete: bool) {
+    println!("\nBy category:");
+    for (c, b, n) in categories_sorted(sized) {
+        println!(
+            "  {:<11} {:>10}  ({} dir{})",
+            c,
+            human(b),
+            n,
+            if n == 1 { "" } else { "s" }
+        );
+    }
+    let total: u64 = sized.iter().map(|s| s.bytes).sum();
+    println!(
+        "\nTotal reclaimable: {} across {} directories.",
+        human(total),
+        sized.len()
+    );
+    if !delete {
+        println!("Dry run — nothing deleted. Re-run with --delete to remove.");
+    }
+}
+
+fn scanned_line(scanned: u64, roots: &[PathBuf], elapsed: Duration) {
+    // Name the single root, but never imply a multi-root scan covered only the first.
+    let scope = match roots {
+        [only] => only.display().to_string(),
+        [first, rest @ ..] => format!("{} and {} more", first.display(), rest.len()),
+        [] => ".".to_string(),
+    };
+    println!(
+        "Scanned {} directories under {} in {:.2}s.",
+        commafy(scanned),
+        scope,
+        elapsed.as_secs_f64()
+    );
+}
+
+/// Batch mode (non-tty / --progress never): full sorted table, then breakdown.
+fn print_report(
+    sized: &[Sized],
+    scanned: u64,
+    elapsed: Duration,
+    roots: &[PathBuf],
+    min_size: u64,
+    delete: bool,
+    path_width: usize,
+) {
+    scanned_line(scanned, roots, elapsed);
+    if sized.is_empty() {
+        println!(
+            "No reclaimable directories found{}.",
+            if min_size > 0 {
+                " above the size threshold"
+            } else {
+                ""
+            }
+        );
+        return;
+    }
+    println!();
+    println!("{:>10}  {:<11}  PATH", "SIZE", "CATEGORY");
+    for s in sized {
+        println!(
+            "{:>10}  {:<11}  {}",
+            human(s.bytes),
+            s.category,
+            elide(&s.path.to_string_lossy(), path_width)
+        );
+    }
+    print_breakdown(sized, delete);
+}
+
+/// Live mode: per-dir rows already streamed by the reporter, so just the tail.
+fn print_live_summary(
+    sized: &[Sized],
+    scanned: u64,
+    elapsed: Duration,
+    roots: &[PathBuf],
+    min_size: u64,
+    delete: bool,
+) {
+    println!();
+    scanned_line(scanned, roots, elapsed);
+    if sized.is_empty() {
+        println!(
+            "No reclaimable directories found{}.",
+            if min_size > 0 {
+                " above the size threshold"
+            } else {
+                ""
+            }
+        );
+        return;
+    }
+    print_breakdown(sized, delete);
+}
+
+/// Write one NDJSON line to stdout and flush immediately, so a UI driving us as a
+/// subprocess sees each event in realtime rather than in a buffered burst.
+fn emit(line: String) {
 
 fn main() {
     let cli = Cli::parse();
@@ -552,12 +679,10 @@ fn main() {
         exclude: HashSet::new(),
     };
     let prog = Progress::default();
-    let done = AtomicBool::new(false);
-    let start = Instant::now();
     let root = cli.paths.first().cloned().unwrap_or_else(|| PathBuf::from("."));
-    thread::scope(|s| {
-        s.spawn(|| human_reporter(&prog, &done, start, 0));
-        scan(&root, &ctx, &prog, &root);
-        done.store(true, Ordering::SeqCst);
-    });
+    let start = Instant::now();
+    scan(&root, &ctx, &prog, &root);
+    let elapsed = start.elapsed();
+    let matches = prog.matches.lock().unwrap();
+    print_report(&matches, prog.scanned.load(Ordering::Relaxed), &[root], elapsed, false);
 }
