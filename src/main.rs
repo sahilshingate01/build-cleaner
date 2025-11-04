@@ -566,6 +566,28 @@ fn print_targets(targets: &[Target]) {
 }
 
 fn print_json(sized: &[Sized], scanned: u64, secs: f64) {
+    let total: u64 = sized.iter().map(|s| s.bytes).sum();
+    let mut items = String::new();
+    for (i, s) in sized.iter().enumerate() {
+        if i > 0 {
+            items.push(',');
+        }
+        items.push_str(&format!(
+            "{{\"path\":\"{}\",\"category\":\"{}\",\"bytes\":{},\"files\":{}}}",
+            json_escape(&s.path.to_string_lossy()),
+            json_escape(&s.category),
+            s.bytes,
+            s.files
+        ));
+    }
+    println!(
+        "{{\"scanned_dirs\":{},\"elapsed_secs\":{:.3},\"total_bytes\":{},\"count\":{},\"items\":[{}]}}",
+        scanned, secs, total, sized.len(), items
+    );
+}
+
+/// Terminating `summary` event for the NDJSON stream.
+fn stream_summary(sized: &[Sized], scanned: u64, secs: f64) {
 fn print_breakdown(sized: &[Sized], delete: bool) {
     println!("\nBy category:");
     for (c, b, n) in categories_sorted(sized) {
@@ -684,5 +706,9 @@ fn main() {
     scan(&root, &ctx, &prog, &root);
     let elapsed = start.elapsed();
     let matches = prog.matches.lock().unwrap();
-    print_report(&matches, prog.scanned.load(Ordering::Relaxed), &[root], elapsed, false);
+    if cli.json {
+        print_json(&matches, prog.scanned.load(Ordering::Relaxed), elapsed.as_secs_f64());
+    } else {
+        print_report(&matches, prog.scanned.load(Ordering::Relaxed), &[root], elapsed, false);
+    }
 }
