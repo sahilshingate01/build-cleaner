@@ -451,6 +451,53 @@ fn human_reporter(
 /// Machine live view: emit newline-delimited JSON events on stdout — a `match`
 /// per reclaimable dir as it's sized, and a `progress` heartbeat each tick.
 fn ndjson_reporter(prog: &Progress, done: &AtomicBool, start: Instant, min_size: u64) {
+    let mut consumed = 0usize;
+    let mut shown = 0u64;
+    let mut running = 0u64;
+
+    loop {
+        let newly = take_new(prog, &mut consumed);
+        if !newly.is_empty() {
+            let mut out = io::stdout().lock();
+            for s in &newly {
+                if s.bytes < min_size {
+                    continue;
+                }
+                let _ = writeln!(
+                    out,
+                    "{{\"event\":\"match\",\"path\":\"{}\",\"category\":\"{}\",\"bytes\":{},\"files\":{}}}",
+                    json_escape(&s.path.to_string_lossy()),
+                    json_escape(&s.category),
+                    s.bytes,
+                    s.files
+                );
+                shown += 1;
+                running += s.bytes;
+            }
+            let _ = out.flush();
+        }
+
+        if done.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let scanned = prog.scanned.load(Ordering::Relaxed);
+        {
+            let mut out = io::stdout().lock();
+            let _ = writeln!(
+                out,
+                "{{\"event\":\"progress\",\"scanned\":{},\"matches\":{},\"bytes\":{},\"elapsed_ms\":{}}}",
+                scanned,
+                shown,
+                running,
+                start.elapsed().as_millis()
+            );
+            let _ = out.flush();
+        }
+        thread::sleep(Duration::from_millis(80));
+    }
+}
+
 fn human(bytes: u64) -> String {
     const U: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
     if bytes < 1024 {
@@ -588,6 +635,29 @@ fn print_json(sized: &[Sized], scanned: u64, secs: f64) {
 
 /// Terminating `summary` event for the NDJSON stream.
 fn stream_summary(sized: &[Sized], scanned: u64, secs: f64) {
+    let total: u64 = sized.iter().map(|s| s.bytes).sum();
+    let mut cats = String::new();
+    for (i, (c, b, n)) in categories_sorted(sized).into_iter().enumerate() {
+        if i > 0 {
+            cats.push(',');
+        }
+        cats.push_str(&format!(
+            "{{\"category\":\"{}\",\"bytes\":{},\"dirs\":{}}}",
+            json_escape(&c),
+            b,
+            n
+        ));
+    }
+    let mut out = io::stdout().lock();
+    let _ = writeln!(
+        out,
+        "{{\"event\":\"summary\",\"scanned\":{},\"elapsed_secs\":{:.3},\"total_bytes\":{},\"count\":{},\"categories\":[{}]}}",
+        scanned, secs, total, sized.len(), cats
+    );
+    let _ = out.flush();
+}
+
+/// By-category rollup, grand total, and dry-run note. Shared by both report modes.
 fn print_breakdown(sized: &[Sized], delete: bool) {
     println!("\nBy category:");
     for (c, b, n) in categories_sorted(sized) {
@@ -701,14 +771,16 @@ fn main() {
         exclude: HashSet::new(),
     };
     let prog = Progress::default();
+    let done = AtomicBool::new(false);
     let root = cli.paths.first().cloned().unwrap_or_else(|| PathBuf::from("."));
     let start = Instant::now();
-    scan(&root, &ctx, &prog, &root);
-    let elapsed = start.elapsed();
-    let matches = prog.matches.lock().unwrap();
-    if cli.json {
-        print_json(&matches, prog.scanned.load(Ordering::Relaxed), elapsed.as_secs_f64());
-    } else {
-        print_report(&matches, prog.scanned.load(Ordering::Relaxed), &[root], elapsed, false);
+    if cli.stream {
+        thread::scope(|s| {
+            s.spawn(|| ndjson_reporter(&prog, &done, start, 0));
+            scan(&root, &ctx, &prog, &root);
+            done.store(true, Ordering::SeqCst);
+        });
+        let matches = prog.matches.lock().unwrap();
+        stream_summary(&matches, prog.scanned.load(Ordering::Relaxed), start.elapsed().as_secs_f64());
     }
 }
