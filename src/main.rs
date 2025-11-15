@@ -758,6 +758,54 @@ fn print_live_summary(
 /// Write one NDJSON line to stdout and flush immediately, so a UI driving us as a
 /// subprocess sees each event in realtime rather than in a buffered burst.
 fn emit(line: String) {
+fn delete_interactive(sized: &[Sized], yes: bool, roots: &[PathBuf], ctx: &Ctx) {
+    let total: u64 = sized.iter().map(|s| s.bytes).sum();
+    if !yes {
+        print!(
+            "\nDelete these {} directories and free {}? [y/N] ",
+            sized.len(),
+            human(total)
+        );
+        io::stdout().flush().ok();
+        let mut line = String::new();
+        io::stdin().read_line(&mut line).ok();
+        let ans = line.trim().to_lowercase();
+        if ans != "y" && ans != "yes" {
+            println!("Aborted. Nothing deleted.");
+            return;
+        }
+    }
+    let mut freed = 0u64;
+    let mut failures = 0u64;
+    for s in sized {
+        let deletion_path = match revalidate_within_roots(&s.path, roots, ctx) {
+            Ok((path, _)) => path,
+            Err(e) => {
+                failures += 1;
+                eprintln!("skipped {}: {}", s.path.display(), e);
+                continue;
+            }
+        };
+        match fs::remove_dir_all(&deletion_path) {
+            Ok(_) => freed += s.bytes,
+            Err(e) => {
+                failures += 1;
+                eprintln!("failed to delete {}: {}", s.path.display(), e);
+            }
+        }
+    }
+    println!(
+        "\nDeleted {} directories, freed {}{}.",
+        sized.len() as u64 - failures,
+        human(freed),
+        if failures > 0 {
+            format!(" ({} failed)", failures)
+        } else {
+            String::new()
+        }
+    );
+}
+
 
 fn main() {
     let cli = Cli::parse();
@@ -771,16 +819,10 @@ fn main() {
         exclude: HashSet::new(),
     };
     let prog = Progress::default();
-    let done = AtomicBool::new(false);
     let root = cli.paths.first().cloned().unwrap_or_else(|| PathBuf::from("."));
-    let start = Instant::now();
-    if cli.stream {
-        thread::scope(|s| {
-            s.spawn(|| ndjson_reporter(&prog, &done, start, 0));
-            scan(&root, &ctx, &prog, &root);
-            done.store(true, Ordering::SeqCst);
-        });
-        let matches = prog.matches.lock().unwrap();
-        stream_summary(&matches, prog.scanned.load(Ordering::Relaxed), start.elapsed().as_secs_f64());
+    scan(&root, &ctx, &prog, &root);
+    let matches = prog.matches.lock().unwrap();
+    if cli.delete {
+        delete_interactive(&matches, cli.yes, &[root], &ctx);
     }
 }
