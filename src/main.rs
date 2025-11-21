@@ -758,6 +758,58 @@ fn print_live_summary(
 /// Write one NDJSON line to stdout and flush immediately, so a UI driving us as a
 /// subprocess sees each event in realtime rather than in a buffered burst.
 fn emit(line: String) {
+fn delete_stream(sized: &[Sized], roots: &[PathBuf], ctx: &Ctx) {
+    let mut freed = 0u64;
+    let mut deleted = 0u64;
+    let mut failed = 0u64;
+    {
+        let mut out = io::stdout().lock();
+        for s in sized {
+            let deletion_path = match revalidate_within_roots(&s.path, roots, ctx) {
+                Ok((path, _)) => path,
+                Err(e) => {
+                    failed += 1;
+                    let _ = writeln!(
+                        out,
+                        "{{\"event\":\"delete_error\",\"path\":\"{}\",\"error\":\"{}\"}}",
+                        json_escape(&s.path.to_string_lossy()),
+                        json_escape(&e)
+                    );
+                    continue;
+                }
+            };
+            match fs::remove_dir_all(&deletion_path) {
+                Ok(_) => {
+                    freed += s.bytes;
+                    deleted += 1;
+                    let _ = writeln!(
+                        out,
+                        "{{\"event\":\"deleted\",\"path\":\"{}\",\"bytes\":{}}}",
+                        json_escape(&s.path.to_string_lossy()),
+                        s.bytes
+                    );
+                }
+                Err(e) => {
+                    failed += 1;
+                    let _ = writeln!(
+                        out,
+                        "{{\"event\":\"delete_error\",\"path\":\"{}\",\"error\":\"{}\"}}",
+                        json_escape(&s.path.to_string_lossy()),
+                        json_escape(&e.to_string())
+                    );
+                }
+            }
+            let _ = out.flush();
+        }
+        let _ = writeln!(
+            out,
+            "{{\"event\":\"delete_summary\",\"deleted\":{},\"failed\":{},\"freed_bytes\":{}}}",
+            deleted, failed, freed
+        );
+        let _ = out.flush();
+    }
+}
+
 fn delete_interactive(sized: &[Sized], yes: bool, roots: &[PathBuf], ctx: &Ctx) {
     let total: u64 = sized.iter().map(|s| s.bytes).sum();
     if !yes {
@@ -822,7 +874,7 @@ fn main() {
     let root = cli.paths.first().cloned().unwrap_or_else(|| PathBuf::from("."));
     scan(&root, &ctx, &prog, &root);
     let matches = prog.matches.lock().unwrap();
-    if cli.delete {
-        delete_interactive(&matches, cli.yes, &[root], &ctx);
+    if cli.delete && cli.stream {
+        delete_stream(&matches, &[root], &ctx);
     }
 }
