@@ -758,6 +758,64 @@ fn print_live_summary(
 /// Write one NDJSON line to stdout and flush immediately, so a UI driving us as a
 /// subprocess sees each event in realtime rather than in a buffered burst.
 fn emit(line: String) {
+    let mut o = io::stdout().lock();
+    let _ = writeln!(o, "{}", line);
+    let _ = o.flush();
+}
+
+/// Extract the string value of the top-level `"path"` key from one JSON line.
+/// Lines without a path (e.g. progress/summary events piped back verbatim) yield
+/// None and are skipped by the caller.
+fn json_extract_path(line: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()?
+        .get("path")?
+        .as_str()
+        .map(ToOwned::to_owned)
+}
+
+/// Read the paths to operate on from stdin, one per line (or one JSON object per line).
+fn read_input_paths_from<R: BufRead>(reader: R, fmt: InputFormat) -> Result<Vec<PathBuf>, String> {
+    let mut paths = Vec::new();
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(e) => return Err(format!("failed reading stdin: {e}")),
+        };
+        if line.len() > MAX_INPUT_LINE_BYTES {
+            return Err(format!(
+                "stdin line exceeds the {} byte limit",
+                MAX_INPUT_LINE_BYTES
+            ));
+        }
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if paths.len() == MAX_INPUT_PATHS {
+            return Err(format!("stdin exceeds the {} path limit", MAX_INPUT_PATHS));
+        }
+        match fmt {
+            InputFormat::Text => paths.push(PathBuf::from(t)),
+            InputFormat::StreamJson => {
+                if let Some(p) = json_extract_path(t) {
+                    paths.push(PathBuf::from(p));
+                }
+            }
+        }
+    }
+    Ok(paths)
+}
+
+fn read_input_paths(fmt: InputFormat) -> Result<Vec<PathBuf>, String> {
+    read_input_paths_from(io::stdin().lock(), fmt)
+}
+
+/// Re-check that a caller-supplied path really is a reclaimable target before we
+/// size or delete it — the exact rule the scanner uses (known name + marker gate),
+/// plus "exists, is a real directory, not a symlink, not excluded". This is the
+/// safety net that stops a buggy UI handing us an arbitrary directory to delete.
+fn revalidate(path: &Path, ctx: &Ctx) -> Result<String, &'static str> {
 fn delete_stream(sized: &[Sized], roots: &[PathBuf], ctx: &Ctx) {
     let mut freed = 0u64;
     let mut deleted = 0u64;
@@ -861,20 +919,10 @@ fn delete_interactive(sized: &[Sized], yes: bool, roots: &[PathBuf], ctx: &Ctx) 
 
 fn main() {
     let cli = Cli::parse();
-    let targets = default_targets();
-    let index = build_index(&targets);
-    let ctx = Ctx {
-        targets,
-        index,
-        min_size: 0,
-        follow_symlinks: cli.follow_symlinks,
-        exclude: HashSet::new(),
-    };
-    let prog = Progress::default();
-    let root = cli.paths.first().cloned().unwrap_or_else(|| PathBuf::from("."));
-    scan(&root, &ctx, &prog, &root);
-    let matches = prog.matches.lock().unwrap();
-    if cli.delete && cli.stream {
-        delete_stream(&matches, &[root], &ctx);
+    if let Some(fmt) = cli.input_format {
+        match read_input_paths(fmt) {
+            Ok(paths) => println!("Read {} paths from stdin", paths.len()),
+            Err(e) => eprintln!("Error reading stdin: {}", e),
+        }
     }
 }
