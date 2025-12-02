@@ -816,6 +816,191 @@ fn read_input_paths(fmt: InputFormat) -> Result<Vec<PathBuf>, String> {
 /// plus "exists, is a real directory, not a symlink, not excluded". This is the
 /// safety net that stops a buggy UI handing us an arbitrary directory to delete.
 fn revalidate(path: &Path, ctx: &Ctx) -> Result<String, &'static str> {
+    let meta = fs::symlink_metadata(path).map_err(|_| "path not found")?;
+    if meta.file_type().is_symlink() {
+        return Err("refusing to operate on a symlink");
+    }
+    if !meta.is_dir() {
+        return Err("not a directory");
+    }
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("unreadable directory name")?;
+    if ctx.excludes.contains(name) {
+        return Err("excluded by --exclude");
+    }
+    match match_target(name, path, ctx.index, ctx.targets) {
+        Some(t) => Ok(t.category.clone()),
+        None => Err("not a recognized reclaimable target"),
+    }
+}
+
+/// Collapse a canonicalized root list to the minimal set that covers the same
+/// trees: drop exact duplicates and any root nested inside another. Keeping a
+/// nested root would LOSE matches — the ancestor's walk skips already-visited
+/// directories before match-testing them, so the nested dir itself would never
+/// be reported. Comparison is component-wise, so `/proj-two` is not "inside"
+/// `/proj`.
+fn prune_nested_roots(mut roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    // Sort so every ancestor is seen before the descendants it covers.
+    roots.sort();
+    let mut kept: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        if kept.iter().any(|k| root.starts_with(k)) {
+            continue;
+        }
+        kept.push(root);
+    }
+    kept
+}
+
+fn revalidate_within_roots(
+    path: &Path,
+    roots: &[PathBuf],
+    ctx: &Ctx,
+) -> Result<(PathBuf, String), String> {
+    let category = revalidate(path, ctx).map_err(str::to_owned)?;
+    let canonical = fs::canonicalize(path).map_err(|e| format!("cannot resolve path: {e}"))?;
+    if !roots.iter().any(|root| canonical.starts_with(root)) {
+        return Err("path resolves outside the scanned roots".to_string());
+    }
+    Ok((canonical, category))
+}
+
+/// Input mode: measure — or, with `delete`, remove — an explicit list of paths.
+/// Every path is re-validated first; rejects never touch the filesystem.
+fn run_input_mode(paths: &[PathBuf], ctx: &Ctx, out: OutputFormat, delete: bool, min_size: u64) {
+    let stream = out == OutputFormat::StreamJson;
+
+    if stream {
+        emit(format!(
+            "{{\"event\":\"start\",\"input\":true,\"delete\":{},\"count\":{}}}",
+            delete,
+            paths.len()
+        ));
+    }
+
+    let mut valid: Vec<Sized> = Vec::new();
+    let mut freed = 0u64;
+    let mut deleted = 0u64;
+    let mut failed = 0u64;
+
+    for p in paths {
+        match revalidate(p, ctx) {
+            Ok(category) => {
+                let (bytes, files) = dir_size(p, ctx.follow_symlinks);
+                if bytes < min_size {
+                    continue;
+                }
+                if delete {
+                    match fs::remove_dir_all(p) {
+                        Ok(_) => {
+                            freed += bytes;
+                            deleted += 1;
+                            if stream {
+                                emit(format!(
+                                    "{{\"event\":\"deleted\",\"path\":\"{}\",\"bytes\":{}}}",
+                                    json_escape(&p.to_string_lossy()),
+                                    bytes
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            failed += 1;
+                            if stream {
+                                emit(format!(
+                                    "{{\"event\":\"delete_error\",\"path\":\"{}\",\"error\":\"{}\"}}",
+                                    json_escape(&p.to_string_lossy()),
+                                    json_escape(&e.to_string())
+                                ));
+                            } else {
+                                eprintln!("failed to delete {}: {}", p.display(), e);
+                            }
+                        }
+                    }
+                } else {
+                    if stream {
+                        emit(format!(
+                            "{{\"event\":\"match\",\"path\":\"{}\",\"category\":\"{}\",\"bytes\":{},\"files\":{}}}",
+                            json_escape(&p.to_string_lossy()),
+                            json_escape(&category),
+                            bytes,
+                            files
+                        ));
+                    }
+                    valid.push(Sized {
+                        path: p.clone(),
+                        category,
+                        bytes,
+                        files,
+                    });
+                }
+            }
+            Err(reason) => {
+                failed += 1;
+                if stream {
+                    emit(format!(
+                        "{{\"event\":\"{}\",\"path\":\"{}\",\"error\":\"{}\"}}",
+                        if delete { "delete_error" } else { "rejected" },
+                        json_escape(&p.to_string_lossy()),
+                        json_escape(reason)
+                    ));
+                } else {
+                    eprintln!("skipped {}: {}", p.display(), reason);
+                }
+            }
+        }
+    }
+
+    if delete {
+        match out {
+            OutputFormat::StreamJson => emit(format!(
+                "{{\"event\":\"delete_summary\",\"deleted\":{},\"failed\":{},\"freed_bytes\":{}}}",
+                deleted, failed, freed
+            )),
+            OutputFormat::Json => println!(
+                "{{\"deleted\":{},\"failed\":{},\"freed_bytes\":{}}}",
+                deleted, failed, freed
+            ),
+            OutputFormat::Text => println!(
+                "Deleted {} director{}, freed {}{}.",
+                deleted,
+                if deleted == 1 { "y" } else { "ies" },
+                human(freed),
+                if failed > 0 {
+                    format!(" ({} skipped/failed)", failed)
+                } else {
+                    String::new()
+                }
+            ),
+        }
+    } else {
+        valid.sort_by_key(|s| Reverse(s.bytes));
+        match out {
+            OutputFormat::StreamJson => stream_summary(&valid, paths.len() as u64, 0.0),
+            OutputFormat::Json => print_json(&valid, paths.len() as u64, 0.0),
+            OutputFormat::Text => {
+                if valid.is_empty() {
+                    println!("No reclaimable directories in the provided list.");
+                } else {
+                    println!("{:>10}  {:<11}  PATH", "SIZE", "CATEGORY");
+                    for s in &valid {
+                        println!(
+                            "{:>10}  {:<11}  {}",
+                            human(s.bytes),
+                            s.category,
+                            s.path.display()
+                        );
+                    }
+                    print_breakdown(&valid, false);
+                }
+            }
+        }
+    }
+}
+
+fn main() {
 fn delete_stream(sized: &[Sized], roots: &[PathBuf], ctx: &Ctx) {
     let mut freed = 0u64;
     let mut deleted = 0u64;
@@ -919,10 +1104,18 @@ fn delete_interactive(sized: &[Sized], yes: bool, roots: &[PathBuf], ctx: &Ctx) 
 
 fn main() {
     let cli = Cli::parse();
+    let targets = default_targets();
+    let index = build_index(&targets);
+    let ctx = Ctx {
+        targets,
+        index,
+        min_size: 0,
+        follow_symlinks: cli.follow_symlinks,
+        exclude: HashSet::new(),
+    };
     if let Some(fmt) = cli.input_format {
-        match read_input_paths(fmt) {
-            Ok(paths) => println!("Read {} paths from stdin", paths.len()),
-            Err(e) => eprintln!("Error reading stdin: {}", e),
+        if let Ok(paths) = read_input_paths(fmt) {
+            run_input_mode(&paths, &ctx, effective_output(&cli), cli.delete, 0);
         }
     }
 }
