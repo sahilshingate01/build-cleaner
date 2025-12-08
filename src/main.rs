@@ -195,6 +195,41 @@ fn default_targets() -> Vec<Target> {
 }
 
 fn parse_config(path: &Path) -> io::Result<Vec<Target>> {
+    let text = fs::read_to_string(path)?;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.splitn(3, ':');
+        let name = parts.next().unwrap().trim();
+        if name.is_empty() {
+            continue;
+        }
+        let category = parts
+            .next()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(name);
+        let markers: Vec<String> = parts
+            .next()
+            .map(|s| {
+                s.split(',')
+                    .map(|m| m.trim().to_string())
+                    .filter(|m| !m.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.push(Target {
+            name: name.to_string(),
+            category: category.to_string(),
+            markers,
+        });
+    }
+    Ok(out)
+}
+
 fn build_index(targets: &[Target]) -> HashMap<String, usize> {
     let mut m = HashMap::new();
     for (i, t) in targets.iter().enumerate() {
@@ -1001,6 +1036,198 @@ fn run_input_mode(paths: &[PathBuf], ctx: &Ctx, out: OutputFormat, delete: bool,
 }
 
 fn main() {
+    let cli = Cli::parse();
+
+    let mut targets = default_targets();
+    if let Some(cfg) = &cli.config {
+        match parse_config(cfg) {
+            Ok(mut extra) => targets.append(&mut extra),
+            Err(e) => {
+                eprintln!("error reading config {}: {}", cfg.display(), e);
+                std::process::exit(2);
+            }
+        }
+    }
+    for name in &cli.include {
+        targets.push(Target {
+            name: name.clone(),
+            category: "include".to_string(),
+            markers: vec![],
+        });
+    }
+    let index = build_index(&targets);
+
+    if cli.list_targets {
+        print_targets(&targets);
+        return;
+    }
+
+    let out = effective_output(&cli);
+
+    // A delete we can't confirm interactively (machine output, stdin-fed paths, or a
+    // non-tty) must be explicitly opted into with --yes.
+    let can_prompt =
+        out == OutputFormat::Text && cli.input_format.is_none() && io::stdin().is_terminal();
+    if cli.delete && !cli.yes && !can_prompt {
+        eprintln!("--delete without an interactive terminal requires --yes");
+        std::process::exit(2);
+    }
+
+    let min_size = match &cli.min_size {
+        Some(s) => match parse_size(s) {
+            Some(v) => v,
+            None => {
+                eprintln!("invalid --min-size: {}", s);
+                std::process::exit(2);
+            }
+        },
+        None => 0,
+    };
+
+    let excludes: HashSet<String> = cli.exclude.iter().cloned().collect();
+    let ctx = Ctx {
+        targets: &targets,
+        index: &index,
+        excludes: &excludes,
+        follow_symlinks: cli.follow_symlinks,
+    };
+
+    // ---- Input mode: operate on an explicit list of paths from stdin ----
+    if let Some(fmt) = cli.input_format {
+        let paths = match read_input_paths(fmt) {
+            Ok(paths) => paths,
+            Err(e) => {
+                eprintln!("invalid stdin input: {e}");
+                std::process::exit(2);
+            }
+        };
+        run_input_mode(&paths, &ctx, out, cli.delete, min_size);
+        return;
+    }
+
+    // ---- Scan mode: walk one or more trees ----
+    let requested = if cli.paths.is_empty() {
+        vec![PathBuf::from(".")]
+    } else {
+        cli.paths.clone()
+    };
+
+    // Canonicalize every requested root, warning about (and skipping) the ones we
+    // can't read, then collapse duplicates and nested roots so an overlapping
+    // drop scans each tree exactly once.
+    let mut resolved: Vec<PathBuf> = Vec::new();
+    for p in &requested {
+        match fs::canonicalize(p) {
+            Ok(c) => resolved.push(c),
+            Err(e) => eprintln!("cannot access {}: {}", p.display(), e),
+        }
+    }
+    if resolved.is_empty() {
+        std::process::exit(2);
+    }
+    let roots = prune_nested_roots(resolved);
+    // A representative root for the human-facing text reporters (which describe a
+    // single "under <root>" scope). The stream-json path the UI drives ignores it.
+    let display_root = roots[0].clone();
+
+    if cli.delete && out == OutputFormat::Json {
+        eprintln!(
+            "--output-format json with --delete is ambiguous; use --output-format stream-json"
+        );
+        std::process::exit(2);
+    }
+
+    let live = out == OutputFormat::Text
+        && match cli.progress {
+            ProgressWhen::Always => true,
+            ProgressWhen::Never => false,
+            ProgressWhen::Auto => io::stderr().is_terminal(),
+        };
+
+    // Path column budget: table prefix is 25 cols (size 10 + gap 2 + cat 11 + gap 2).
+    // TTY width wins; else honor COLUMNS (an app/pipe can request a width); else 0 = full paths.
+    let path_width = terminal_size()
+        .map(|(Width(w), _)| w as usize)
+        .or_else(|| {
+            std::env::var("COLUMNS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+        })
+        .map(|w| w.saturating_sub(25).max(24))
+        .unwrap_or(0);
+
+    let prog = Progress {
+        scanned: AtomicU64::new(0),
+        matches: Mutex::new(Vec::new()),
+        // Pre-seed the visited set with every root so overlapping/nested roots
+        // don't re-walk shared subtrees or emit a directory twice.
+        visited: Mutex::new(roots.iter().cloned().collect()),
+    };
+    let done = AtomicBool::new(false);
+
+    if out == OutputFormat::StreamJson {
+        let mut o = io::stdout().lock();
+        let _ = writeln!(
+            o,
+            "{{\"event\":\"start\",\"root\":\"{}\",\"roots\":{},\"min_bytes\":{}}}",
+            json_escape(&display_root.to_string_lossy()),
+            roots.len(),
+            min_size
+        );
+        let _ = o.flush();
+    }
+
+    let start = Instant::now();
+    thread::scope(|s| {
+        if live {
+            let pr = &prog;
+            let dn = &done;
+            s.spawn(move || human_reporter(pr, dn, start, min_size, path_width));
+        } else if out == OutputFormat::StreamJson {
+            let pr = &prog;
+            let dn = &done;
+            s.spawn(move || ndjson_reporter(pr, dn, start, min_size));
+        }
+        for root in &roots {
+            scan(root, &ctx, &prog, root);
+        }
+        done.store(true, Ordering::Relaxed);
+    });
+    let elapsed = start.elapsed();
+    let scanned = prog.scanned.load(Ordering::Relaxed);
+
+    let mut sized: Vec<Sized> = prog
+        .matches
+        .into_inner()
+        .unwrap()
+        .into_iter()
+        .filter(|s| s.bytes >= min_size)
+        .collect();
+    sized.sort_by_key(|s| Reverse(s.bytes));
+
+    match out {
+        OutputFormat::StreamJson => stream_summary(&sized, scanned, elapsed.as_secs_f64()),
+        OutputFormat::Json => print_json(&sized, scanned, elapsed.as_secs_f64()),
+        OutputFormat::Text => {
+            if live {
+                print_live_summary(&sized, scanned, elapsed, &roots, min_size, cli.delete);
+            } else {
+                print_report(
+                    &sized, scanned, elapsed, &roots, min_size, cli.delete, path_width,
+                );
+            }
+        }
+    }
+
+    if cli.delete && !sized.is_empty() {
+        match out {
+            OutputFormat::Text => delete_interactive(&sized, cli.yes, &roots, &ctx),
+            OutputFormat::StreamJson => delete_stream(&sized, &roots, &ctx),
+            OutputFormat::Json => unreachable!("json delete is rejected before scanning"),
+        }
+    }
+}
+
 fn delete_stream(sized: &[Sized], roots: &[PathBuf], ctx: &Ctx) {
     let mut freed = 0u64;
     let mut deleted = 0u64;
@@ -1101,21 +1328,4 @@ fn delete_interactive(sized: &[Sized], yes: bool, roots: &[PathBuf], ctx: &Ctx) 
     );
 }
 
-
-fn main() {
-    let cli = Cli::parse();
-    let targets = default_targets();
-    let index = build_index(&targets);
-    let ctx = Ctx {
-        targets,
-        index,
-        min_size: 0,
-        follow_symlinks: cli.follow_symlinks,
-        exclude: HashSet::new(),
-    };
-    if let Some(fmt) = cli.input_format {
-        if let Ok(paths) = read_input_paths(fmt) {
-            run_input_mode(&paths, &ctx, effective_output(&cli), cli.delete, 0);
-        }
-    }
-}
+#[cfg(test)]
