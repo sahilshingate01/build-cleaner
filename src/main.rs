@@ -1329,3 +1329,271 @@ fn delete_interactive(sized: &[Sized], yes: bool, roots: &[PathBuf], ctx: &Ctx) 
 }
 
 #[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_dir(name: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "buildcleaner-test-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    #[test]
+    fn elide_leaves_short_paths() {
+        assert_eq!(elide("/a/b/c", 40), "/a/b/c");
+    }
+
+    #[test]
+    fn elide_zero_disables() {
+        let s = "/very/long/path/that/keeps/going/node_modules";
+        assert_eq!(elide(s, 0), s);
+    }
+
+    #[test]
+    fn elide_keeps_head_and_tail_at_exact_width() {
+        let s = "/Users/dev/code/workspace/project/node_modules";
+        let out = elide(s, 30);
+        assert_eq!(out.chars().count(), 30);
+        assert!(out.contains('…'));
+        let head: String = s.chars().take(14).collect();
+        let tail: String = s.chars().skip(s.chars().count() - 15).collect();
+        assert!(out.starts_with(&head), "got {out}");
+        assert!(out.ends_with(&tail), "got {out}");
+    }
+
+    #[test]
+    fn parse_size_units() {
+        assert_eq!(parse_size("1024"), Some(1024));
+        assert_eq!(parse_size("1K"), Some(1024));
+        assert_eq!(parse_size("1.5M"), Some(1_572_864));
+        assert_eq!(parse_size("2G"), Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(parse_size("bogus"), None);
+    }
+
+    #[test]
+    fn human_rounds() {
+        assert_eq!(human(512), "512 B");
+        assert_eq!(human(1024), "1.0 KB");
+        assert_eq!(human(1_572_864), "1.5 MB");
+    }
+
+    #[test]
+    fn json_extract_path_roundtrips_a_match_event() {
+        let p = "/Users/x/a b/node_modules";
+        let line = format!(
+            "{{\"event\":\"match\",\"path\":\"{}\",\"bytes\":10}}",
+            json_escape(p)
+        );
+        assert_eq!(json_extract_path(&line).as_deref(), Some(p));
+    }
+
+    #[test]
+    fn json_extract_path_handles_escapes() {
+        let p = "/tmp/we\"ird\\path/\tnode_modules";
+        let line = format!("{{\"path\":\"{}\"}}", json_escape(p));
+        assert_eq!(json_extract_path(&line).as_deref(), Some(p));
+    }
+
+    #[test]
+    fn json_extract_path_handles_unicode_surrogate_pairs() {
+        assert_eq!(
+            json_extract_path(r#"{"path":"/tmp/rocket-\uD83D\uDE80/node_modules"}"#).as_deref(),
+            Some("/tmp/rocket-🚀/node_modules")
+        );
+    }
+
+    #[test]
+    fn json_extract_path_none_without_a_path_key() {
+        assert_eq!(
+            json_extract_path("{\"event\":\"progress\",\"scanned\":5}"),
+            None
+        );
+        assert_eq!(json_extract_path("just a plain path string"), None);
+        assert_eq!(
+            json_extract_path(r#"{"payload":{"path":"/tmp/node_modules"}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn stdin_input_limits_path_count_and_line_size() {
+        let too_many = "node_modules\n".repeat(MAX_INPUT_PATHS + 1);
+        assert!(
+            read_input_paths_from(Cursor::new(too_many), InputFormat::Text)
+                .unwrap_err()
+                .contains("path limit")
+        );
+
+        let too_long = format!("{}\n", "a".repeat(MAX_INPUT_LINE_BYTES + 1));
+        assert!(
+            read_input_paths_from(Cursor::new(too_long), InputFormat::Text)
+                .unwrap_err()
+                .contains("line exceeds")
+        );
+    }
+
+    #[test]
+    fn revalidation_requires_the_scanned_root() {
+        let base = test_dir("root-boundary");
+        let root = base.join("root");
+        let inside = root.join("node_modules");
+        let outside = base.join("outside/node_modules");
+        fs::create_dir_all(&inside).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        let targets = default_targets();
+        let index = build_index(&targets);
+        let excludes = HashSet::new();
+        let ctx = Ctx {
+            targets: &targets,
+            index: &index,
+            excludes: &excludes,
+            follow_symlinks: false,
+        };
+        let roots = vec![fs::canonicalize(&root).unwrap()];
+        assert!(revalidate_within_roots(&inside, &roots, &ctx).is_ok());
+        assert!(revalidate_within_roots(&outside, &roots, &ctx).is_err());
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Dropping a folder AND a folder inside it must not hide results: the
+    /// descendant is redundant, and keeping both once made the nested dir
+    /// invisible (the ancestor's walk skipped it as already-visited before it
+    /// was ever match-tested).
+    #[test]
+    fn nested_roots_are_pruned_so_no_match_is_lost() {
+        let base = test_dir("nested-roots");
+        let outer = base.join("proj");
+        let inner = outer.join("packages/app");
+        fs::create_dir_all(inner.join("node_modules")).unwrap();
+        fs::create_dir_all(outer.join("node_modules")).unwrap();
+
+        let outer_c = fs::canonicalize(&outer).unwrap();
+        let inner_c = fs::canonicalize(&inner).unwrap();
+
+        // Ancestor first, descendant second, and the reverse: both prune to the ancestor.
+        assert_eq!(
+            prune_nested_roots(vec![outer_c.clone(), inner_c.clone()]),
+            vec![outer_c.clone()]
+        );
+        assert_eq!(
+            prune_nested_roots(vec![inner_c.clone(), outer_c.clone()]),
+            vec![outer_c.clone()]
+        );
+        // A sibling that merely shares a name prefix is NOT nested.
+        let sibling = base.join("proj-two");
+        fs::create_dir_all(&sibling).unwrap();
+        let sibling_c = fs::canonicalize(&sibling).unwrap();
+        assert_eq!(
+            prune_nested_roots(vec![outer_c.clone(), sibling_c.clone()]).len(),
+            2
+        );
+        // Exact duplicates collapse.
+        assert_eq!(
+            prune_nested_roots(vec![outer_c.clone(), outer_c.clone()]),
+            vec![outer_c.clone()]
+        );
+
+        // End to end: scanning the pruned root still finds the nested target.
+        let targets = default_targets();
+        let index = build_index(&targets);
+        let excludes = HashSet::new();
+        let ctx = Ctx {
+            targets: &targets,
+            index: &index,
+            excludes: &excludes,
+            follow_symlinks: false,
+        };
+        let roots = prune_nested_roots(vec![outer_c.clone(), inner_c.clone()]);
+        let prog = Progress {
+            scanned: AtomicU64::new(0),
+            matches: Mutex::new(Vec::new()),
+            visited: Mutex::new(roots.iter().cloned().collect()),
+        };
+        for root in &roots {
+            scan(root, &ctx, &prog, root);
+        }
+        let found: HashSet<PathBuf> = prog
+            .matches
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|m| m.path.clone())
+            .collect();
+        assert!(found.contains(&outer_c.join("node_modules")));
+        assert!(
+            found.contains(&inner_c.join("node_modules")),
+            "nested root's own node_modules must still be reported"
+        );
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn follow_symlinks_traverses_in_root_links_without_cycles() {
+        let base = test_dir("follow-links");
+        let root = base.join("root");
+        let source = root.join("source");
+        let target = source.join("node_modules");
+        fs::create_dir_all(&target).unwrap();
+        symlink(&source, root.join("linked")).unwrap();
+        symlink(&source, source.join("cycle")).unwrap();
+
+        let targets = default_targets();
+        let index = build_index(&targets);
+        let excludes = HashSet::from(["source".to_string()]);
+        let ctx = Ctx {
+            targets: &targets,
+            index: &index,
+            excludes: &excludes,
+            follow_symlinks: true,
+        };
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let prog = Progress {
+            scanned: AtomicU64::new(0),
+            matches: Mutex::new(Vec::new()),
+            visited: Mutex::new(HashSet::from([canonical_root.clone()])),
+        };
+        scan(&canonical_root, &ctx, &prog, &canonical_root);
+        let matches = prog.matches.lock().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].path, fs::canonicalize(target).unwrap());
+        drop(matches);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn target_gate_rejects_non_targets_and_ungated_markers() {
+        let targets = default_targets();
+        let index = build_index(&targets);
+        // Unambiguous target: matches with no marker required.
+        assert!(match_target(
+            "node_modules",
+            Path::new("/proj/node_modules"),
+            &index,
+            &targets
+        )
+        .is_some());
+        // Unknown name: never a target.
+        assert!(match_target("src", Path::new("/proj/src"), &index, &targets).is_none());
+        // Marker-gated `target` with no Cargo.toml sibling: rejected.
+        assert!(match_target(
+            "target",
+            Path::new("/no/marker/here/target"),
+            &index,
+            &targets
+        )
+        .is_none());
+    }
+}
