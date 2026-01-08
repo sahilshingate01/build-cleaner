@@ -1,0 +1,18 @@
+{
+  "name": "electron-cleaner",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Tiny Electron UI driving the buildcleaner engine over its JSON stdout protocol.",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "web": "node server.js",
+    "electron": "npm start",
+    "native": "cargo build --release --manifest-path ../../Cargo.toml && cd ../native-cleaner && PATH=\"../../../native/zig-out/bin:$PATH\" zig build dev",
+    "smoke": "node smoke.js"
+  },
+  "devDependencies": {
+    "electron": "^43.2.0"
+  },
+  "trustedDependencies": ["electron"]
+}
