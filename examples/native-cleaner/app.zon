@@ -1,0 +1,37 @@
+.{
+    .id ="dev.native_sdk.native-cleaner",
+    .name ="native-cleaner",
+    .display_name ="Native Cleaner",
+    .version = "0.1.0",
+    .icons = .{ "assets/icon.png" },
+    .platforms = .{ "macos", "linux" },
+    .permissions = .{},
+    .capabilities = .{ "webview", "js_bridge" },
+    .bridge = .{
+        .commands = .{
+            .{ .name = "native-sdk.dialog.openFile", .origins = .{ "http://127.0.0.1:45831" } },
+        },
+    },
+    .frontend = .{
+        .dist ="frontend/dist",
+        .entry = "index.html",
+        .spa_fallback = true,
+        .dev = .{
+            .url ="http://127.0.0.1:45831/",
+            .command = .{ "sh", "-c", "PORT=45831 BUILDCLEANER_NO_OPEN=1 npm --prefix ../electron-cleaner run web" },
+            .ready_path = "/",
+            .timeout_ms = 30000,
+        },
+    },
+    .security = .{
+        .navigation = .{
+            .allowed_origins = .{ "zero://app", "zero://inline", "http://127.0.0.1:45831" },
+            .external_links = .{ .action = "deny" },
+        },
+    },
+    .web_engine = "system",
+    .cef = .{ .dir = "third_party/cef/macos", .auto_install = false },
+    .windows = .{
+        .{ .label = "main", .title ="Native Cleaner", .width = 960, .height = 680, .titlebar = "hidden_inset", .restore_state = true },
+    },
+}
